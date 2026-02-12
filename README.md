@@ -313,7 +313,7 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) file for 
 - **OpenEar Project**: Inspiration for encryption handling
 - **telive**: Reference TETRA decoder implementation
 - **Community**: Thanks to all contributors and testers
-
+- **@Mrscanner2008**: Special thanks for providing real TETRA signals and recordings to better understand the protocol and fix a lot of bugs!
 ---
 
 ## 📞 Contact & Support

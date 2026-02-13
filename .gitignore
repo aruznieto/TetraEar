@@ -21,6 +21,7 @@ wheels/
 *.egg
 logs/
 records/
+sample/
 release/
 resources/*
 
@@ -52,6 +53,8 @@ ENV/
 
 # Codec build artifacts
 .codecbuild/
+tetraear/tetra_codec/bin/cdecoder
+tetraear/tetra_codec/bin/sdecoder
 
 # Development tools
 dev_tools/

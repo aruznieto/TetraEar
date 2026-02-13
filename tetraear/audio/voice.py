@@ -53,21 +53,49 @@ class VoiceProcessor:
         else:
             resolved_codec_dir = default_dir
 
-        self.cdecoder_path = Path(cdecoder_path or codec_path) if (cdecoder_path or codec_path) is not None else (resolved_codec_dir / "cdecoder.exe")
-        self.sdecoder_path = Path(sdecoder_path) if sdecoder_path is not None else (resolved_codec_dir / "sdecoder.exe")
+        def resolve_candidate(provided: str | os.PathLike[str] | None, candidates: list[str]) -> Path:
+            if provided is not None:
+                return Path(provided)
+            for name in candidates:
+                candidate = resolved_codec_dir / name
+                if candidate.exists():
+                    return candidate
+            return resolved_codec_dir / candidates[0]
 
-        self.channel_decoder_available = self.cdecoder_path.exists()
-        self.speech_decoder_available = self.sdecoder_path.exists()
+        self.cdecoder_path = resolve_candidate(cdecoder_path or codec_path, ["cdecoder", "cdecoder.exe"])
+        self.sdecoder_path = resolve_candidate(sdecoder_path, ["sdecoder", "sdecoder.exe"])
+
+        for path in (self.cdecoder_path, self.sdecoder_path):
+            if path.exists() and os.name != "nt":
+                try:
+                    if not os.access(path, os.X_OK):
+                        path.chmod(path.stat().st_mode | 0o111)
+                except Exception:
+                    pass
+
+        def is_windows_binary(path: Path) -> bool:
+            try:
+                with path.open("rb") as handle:
+                    return handle.read(2) == b"MZ"
+            except Exception:
+                return False
+
+        self.channel_decoder_available = self.cdecoder_path.exists() and os.access(self.cdecoder_path, os.X_OK)
+        self.speech_decoder_available = self.sdecoder_path.exists() and os.access(self.sdecoder_path, os.X_OK)
         self.working = self.channel_decoder_available and self.speech_decoder_available
 
         if not self.channel_decoder_available:
             logger.warning("TETRA codec channel decoder not found at %s", self.cdecoder_path)
         else:
+            if os.name != "nt" and is_windows_binary(self.cdecoder_path):
+                logger.warning("Windows codec detected at %s; install native codec or use Wine", self.cdecoder_path)
             logger.debug("TETRA codec channel decoder found at %s", self.cdecoder_path)
 
         if not self.speech_decoder_available:
             logger.warning("TETRA codec speech decoder not found at %s", self.sdecoder_path)
         else:
+            if os.name != "nt" and is_windows_binary(self.sdecoder_path):
+                logger.warning("Windows codec detected at %s; install native codec or use Wine", self.sdecoder_path)
             logger.debug("TETRA codec speech decoder found at %s", self.sdecoder_path)
             
     def decode_frame(self, frame_data: bytes) -> np.ndarray:

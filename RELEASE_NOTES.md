@@ -1,6 +1,55 @@
-# TETRA Decoder Pro - Release Notes v2.1
+# TETRA Decoder Pro - Release Notes v2.3
 
-## December 23-24, 2025
+## February 13, 2026
+
+---
+
+## ✅ **RELEASE HIGHLIGHTS**
+
+- Working TCH voice decode via lower-MAC FEC + ETSI codec block mapping
+- Cleaner network identity + call control parsing (MCC/MNC, GSSI, ISSI)
+- New offline IQ analyzer with multi-carrier support and codec installer script
+
+---
+
+## 🔧 **Critical Fixes**
+
+### 1. **TCH Voice Decode (Audio Restore)**
+**Problem:** Voice bursts were decoding to silence or had no valid codec input.
+
+**Solution:**
+- Added lower-MAC FEC decoding with training sequence detection
+- Build ETSI `cdecoder` input blocks from Type-4 bits
+- Fixed fallback symbol-based extraction for traffic bursts
+
+**Result:** Traffic channels now generate consistent codec input and audible audio.
+
+### 2. **MAC Fragment Reassembly**
+**Problem:** MAC-FRAG/MAC-END messages were occasionally truncated or duplicated.
+
+**Solution:** Fixed MAC-END length handling and fragment state resets.
+
+**Result:** SDS and fragmented messages reassemble cleanly.
+
+### 3. **CMCE / Call Control Parsing**
+**Problem:** Wrong GSSI/ISSI or MCC/MNC occasionally surfaced due to weak frames.
+
+**Solution:** Added CMCE parsing with CRC-tolerant SSI voting and stronger validation.
+
+**Result:** More stable network identity and call metadata.
+
+---
+
+## 🆕 **New Features**
+
+- **Pure-Python lower MAC/FEC pipeline**: Deinterleaving, depuncturing, CRC, and traffic codec input generation.
+- **Offline IQ analyzer (`analyze_iq.py`)**: Auto center-frequency detection, multi-carrier decoding, and log comparison.
+- **Codec installer script**: `scripts/install_tetra_codec.sh` downloads the ETSI reference codec and builds `cdecoder`/`sdecoder`.
+- **Soft-bit decoding**: Symbol confidence now feeds the decoder for improved FEC performance.
+
+---
+
+## December 23-24, 2025 (v2.1)
 
 ---
 

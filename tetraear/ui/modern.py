@@ -338,7 +338,8 @@ class SettingsManager:
         "bandwidth": 25000,
         "zoom_level": 1.0,
         "noise_floor": -85,
-        "theme": "dark"
+        "theme": "dark",
+        "expected_mcc": None
     }
     
     def __init__(self, filename="settings.json"):
@@ -597,7 +598,7 @@ class AboutDialog(QDialog):
         
         # Version and info
         info_label = QLabel("""
-        <h2 style="color: #3b82f6;">TETRA Decoder Pro v2.0</h2>
+        <h2 style="color: #3b82f6;">TETRA Decoder Pro v2.3</h2>
         <p style="color: #a1a1aa;">Professional TETRA signal decoder with real-time spectrum analysis</p>
         <p style="color: #888888;">Features:</p>
         <ul style="color: #a1a1aa;">
@@ -2022,15 +2023,13 @@ class CaptureThread(QThread):
                             demodulated = self.processor.process(samples, freq_offset=afc_offset)
                             
                             # Store demodulated symbols for voice extraction
-                            # Get symbols from processor if available
+                            # Use the hard-decision symbol stream (0-3) for codec input.
+                            self.demodulated_symbols = demodulated if isinstance(demodulated, np.ndarray) else None
+                            # Keep complex symbols separately if needed for future diagnostics.
                             if hasattr(self.processor, 'symbols'):
-                                self.demodulated_symbols = self.processor.symbols
+                                self.demodulated_complex = self.processor.symbols
                             elif hasattr(self.processor, 'get_symbols'):
-                                self.demodulated_symbols = self.processor.get_symbols()
-                            else:
-                                # Extract symbols from demodulated (if it's symbol stream)
-                                # For now, store demodulated as symbols (may need adjustment)
-                                self.demodulated_symbols = demodulated if isinstance(demodulated, np.ndarray) else None
+                                self.demodulated_complex = self.processor.get_symbols()
                             
                             # Calculate samples per symbol (typically 4 for π/4-DQPSK at 18k samples/sec)
                             # TETRA symbol rate is 18k symbols/sec, so at 180k samples/sec: 10 samples/symbol
@@ -2067,7 +2066,10 @@ class CaptureThread(QThread):
                                 if demodulated is None or len(demodulated) < 255:
                                     frames = []
                                 else:
-                                    frames = self.decoder.decode(demodulated)
+                                    frames = self.decoder.decode(
+                                        demodulated,
+                                        confidences=getattr(self.signal_processor, "symbol_confidence", None),
+                                    )
                                     # Log when frames are found (but limit logging frequency)
                                     if len(frames) > 0:
                                         import time
@@ -2092,12 +2094,9 @@ class CaptureThread(QThread):
                                             pdu_type = str(mac_pdu.get('type', ''))
                                             is_encrypted = frame.get('encrypted', False)
                                             
-                                            # Voice candidates: MAC-FRAG/traffic. Allow encrypted frames only if
-                                            # they were successfully decrypted (so we can feed clear bits to the codec).
-                                            is_voice_candidate = (
-                                                ('FRAG' in pdu_type or frame.get('type') == 1)
-                                                and (not is_encrypted or frame.get('decrypted'))
-                                            )
+                                            # Voice candidates: attempt on any non-broadcast burst.
+                                            # Some traffic bursts are misclassified without full FEC decode.
+                                            is_voice_candidate = frame.get('type_name') != 'MAC-BROADCAST'
                                             
                                             if is_voice_candidate:
                                                 # Extract raw bits from the frame
@@ -2127,11 +2126,15 @@ class CaptureThread(QThread):
                                                     except Exception as e:
                                                         logger.debug(f"Error using decrypted payload: {e}")
 
-                                                # Try to extract voice slot from symbol stream (preferred method)
-                                                codec_input = None
-                                                # Only use symbols if NOT encrypted (symbols are raw/encrypted)
-                                                if not frame.get('encrypted') and hasattr(self, 'demodulated_symbols') and self.demodulated_symbols is not None:
-                                                    codec_input = self._extract_voice_slot_from_symbols(frame, self.demodulated_symbols, self.samples_per_symbol)
+                                                # Prefer decoded codec input from the lower-MAC pipeline.
+                                                codec_input = frame.get("codec_input")
+
+                                                # Fallback to symbol-based extraction for legacy paths.
+                                                if codec_input is None and hasattr(self, 'demodulated_symbols') and self.demodulated_symbols is not None:
+                                                    if self.tch_assembler:
+                                                        codec_input = self.tch_assembler.add_burst(self.demodulated_symbols, frame.get('position'))
+                                                    else:
+                                                        codec_input = self._extract_voice_slot_from_symbols(frame, self.demodulated_symbols, self.samples_per_symbol)
                                                 
                                                 # If extraction from symbols failed, try alternative method
                                                 if codec_input is None and voice_bits is not None and len(voice_bits) >= 432:
@@ -2305,109 +2308,10 @@ class CaptureThread(QThread):
         Returns soft bits (16-bit integers) in TETRA format (690 shorts = 1380 bytes).
         """
         try:
-            import struct
-            
-            # Get frame position in symbol stream (in bits, not symbols)
+            from tetraear.audio.tch import extract_tch_codec_input
+
             pos = frame.get('position')
-            if pos is None:
-                return None
-            
-            # Convert bit position to symbol position (3 bits per symbol for π/4-DQPSK)
-            symbol_pos = pos // 3
-                
-            # TETRA slot is 255 symbols (510 bits)
-            if symbol_pos + 255 > len(demodulated_symbols):
-                return None
-                
-            slot_symbols = demodulated_symbols[symbol_pos:symbol_pos+255]
-            
-            # Convert symbols to soft bits for codec
-            # π/4-DQPSK has 2 bits per symbol (dibits)
-            soft_bits = []
-            
-            # Normal burst structure:
-            # First block: 108 symbols (216 bits)
-            # Training: 11 symbols (22 bits)
-            # Second block: 108 symbols (216 bits)
-            # Total: 227 symbols before tail
-            
-            # Extract first block (108 symbols = 216 bits)
-            for i in range(108):
-                if i >= len(slot_symbols):
-                    break
-                sym = int(slot_symbols[i])
-                # Extract 2 bits from symbol (MSB first)
-                bit1 = (sym >> 1) & 1
-                bit0 = sym & 1
-                # Convert to soft bits: 1 -> +16384, 0 -> -16384
-                soft_bits.append(16384 if bit1 else -16384)
-                soft_bits.append(16384 if bit0 else -16384)
-            
-            # Skip training sequence (11 symbols at position 108-118)
-            
-            # Extract second block (108 symbols = 216 bits)
-            for i in range(119, 227):
-                if i >= len(slot_symbols):
-                    break
-                sym = int(slot_symbols[i])
-                bit1 = (sym >> 1) & 1
-                bit0 = sym & 1
-                soft_bits.append(16384 if bit1 else -16384)
-                soft_bits.append(16384 if bit0 else -16384)
-            
-            # Now we have 432 soft bits (216 from each block)
-            # cdecoder expects 690 shorts with specific structure matching Write_Tetra_File format
-            # Soft bits must be in range -127 to +127 (masked with 0x00FF)
-            
-            # Create 690-short block structure
-            block = [0] * 690
-            
-            # Header: 0x6B21 for speech frame
-            block[0] = 0x6B21
-            
-            # Convert soft bits to proper range (-127 to +127)
-            # Current soft_bits are ±16384, need to scale to ±127
-            scaled_soft_bits = []
-            for sb in soft_bits:
-                # Scale from ±16384 to ±127 range
-                scaled = int((sb / 16384.0) * 127)
-                # Clamp to valid range
-                scaled = max(-127, min(127, scaled))
-                scaled_soft_bits.append(scaled)
-            
-            # Place 432 soft bits in correct positions according to Write_Tetra_File structure
-            # Block 1: positions 1-114 (114 bits)
-            # Block 2: positions 116-229 (114 bits) 
-            # Block 3: positions 231-344 (114 bits)
-            # Block 4: positions 346-435 (90 bits)
-            
-            idx = 0
-            # Block 1: positions 1-114
-            for i in range(1, 115):
-                if idx < len(scaled_soft_bits):
-                    block[i] = scaled_soft_bits[idx]  # No mask for signed short
-                    idx += 1
-            
-            # Block 2: positions 116-229 (161-45=116)
-            for i in range(116, 230):
-                if idx < len(scaled_soft_bits):
-                    block[i] = scaled_soft_bits[idx]
-                    idx += 1
-            
-            # Block 3: positions 231-344 (321-45-45=231)
-            for i in range(231, 345):
-                if idx < len(scaled_soft_bits):
-                    block[i] = scaled_soft_bits[idx]
-                    idx += 1
-            
-            # Block 4: positions 346-435 (481-45-45-45=346, 90 values)
-            for i in range(346, 436):
-                if idx < len(scaled_soft_bits):
-                    block[i] = scaled_soft_bits[idx]
-                    idx += 1
-            
-            # Pack as little-endian signed shorts
-            return struct.pack(f'<{len(block)}h', *block)
+            return extract_tch_codec_input(demodulated_symbols, pos)
             
         except Exception as e:
             logger.debug(f"Error extracting voice slot: {e}")
@@ -2513,7 +2417,7 @@ class ModernTetraGUI(QMainWindow):
     
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("TetraEar - Professional TETRA Decoder v2.0")
+        self.setWindowTitle("TetraEar - Professional TETRA Decoder v2.3")
         self.setGeometry(100, 100, 1600, 1100)
         
         # Set application icon
@@ -2552,13 +2456,21 @@ class ModernTetraGUI(QMainWindow):
         self.recording_enabled = False  # Manual recording toggle
         self.recording_start_time = None
         self.recording_has_audio = False  # Track if valid audio was recorded
+        self.tch_assembler = None
         
         # Managers
         self.settings_manager = SettingsManager()
         self.freq_manager = FrequencyManager()
         
-        # TETRA signal validator (expect Poland MCC 260)
-        self.signal_validator = TetraSignalValidator(expected_country_mcc=260)
+        # TETRA signal validator (optionally constrain by expected MCC)
+        expected_mcc = self.settings_manager.get("expected_mcc", None)
+        self.signal_validator = TetraSignalValidator(expected_country_mcc=expected_mcc)
+
+        try:
+            from tetraear.audio.tch import TchFrameAssembler
+            self.tch_assembler = TchFrameAssembler()
+        except Exception:
+            self.tch_assembler = None
         
         self.init_ui()
         self.apply_modern_style()
@@ -4121,6 +4033,7 @@ class ModernTetraGUI(QMainWindow):
         
         # Play audio LIVE if monitoring enabled
         if self.hear_voice_cb.isChecked() and len(data) > 0:
+            play_data = np.clip(data.astype(np.float32), -1.0, 1.0)
             try:
                 # Ensure audio stream exists and is started
                 if not hasattr(self, 'audio_stream') or self.audio_stream is None:
@@ -4136,8 +4049,7 @@ class ModernTetraGUI(QMainWindow):
                         self.audio_stream.start()
                     
                     # Write audio data - YOU WILL HEAR THIS LIVE!
-                    # Normalize int16 to float32 range [-1.0, 1.0]
-                    self.audio_stream.write(data.astype(np.float32) / 32768.0)
+                    self.audio_stream.write(play_data)
             except Exception as e:
                 logger.debug(f"Audio playback error: {e}")
                 # Try to reinitialize audio stream
@@ -4149,7 +4061,7 @@ class ModernTetraGUI(QMainWindow):
                             pass
                     self.init_audio()
                     if hasattr(self, 'audio_stream') and self.audio_stream:
-                        self.audio_stream.write(data.astype(np.float32) / 32768.0)
+                        self.audio_stream.write(play_data)
                 except Exception as e2:
                     logger.debug(f"Audio reinit failed: {e2}")
 

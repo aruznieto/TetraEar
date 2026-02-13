@@ -1,5 +1,22 @@
 # TetraEar Changelog
 
+## Version 2.3 - February 2026
+
+### 🐛 Bug Fixes
+- **TCH voice path**: Build ETSI codec blocks from lower-MAC Type-4 bits and fix fallback extraction to restore audio output.
+- **MAC fragmentation**: Correct MAC-FRAG/MAC-END handling to avoid duplicate or truncated SDS reassembly.
+- **CMCE parsing**: Improve call control decoding with CRC-tolerant SSI voting to reduce wrong GSSI/ISSI and network IDs.
+
+### ✨ New Features
+- **Pure-Python lower MAC/FEC**: Added deinterleaving, depuncturing, CRC, training sequence detection, and traffic codec input generation.
+- **Offline IQ analyzer**: New `analyze_iq.py` with auto center-frequency detection, multi-carrier decoding, and log comparison.
+- **Codec installer script**: `scripts/install_tetra_codec.sh` downloads the ETSI reference codec and builds `cdecoder`/`sdecoder`.
+
+### 🔧 Improvements
+- **Soft-bit decoding**: Decoder can use symbol confidence for better FEC performance.
+- **Multi-carrier tracking**: Carrier offsets tracked via channel allocations to follow hopping systems.
+- **Signal processing fallback**: Resampling/filtering now works without SciPy.
+
 ## Version 2.2 - December 2025
 
 ### 📦 Release

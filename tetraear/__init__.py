@@ -17,7 +17,7 @@ Example:
     >>> processor = SignalProcessor()
 """
 
-__version__ = "2.2"
+__version__ = "2.3"
 __author__ = "TetraEar Team"
 __license__ = "MIT"
 

@@ -184,7 +184,7 @@ def main() -> int:
                 if demodulated is None or len(demodulated) < 255:
                     continue
 
-                frames = decoder.decode(demodulated)
+                frames = decoder.decode(demodulated, confidences=processor.symbol_confidence)
                 if not frames:
                     continue
 

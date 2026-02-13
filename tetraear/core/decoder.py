@@ -9,6 +9,7 @@ from typing import Optional
 
 from tetraear.core.crypto import TEADecryptor, TetraKeyManager
 from tetraear.core.protocol import TetraProtocolParser, TetraBurst, MacPDU, CallMetadata
+from tetraear.core.lower_mac import BlockType, LowerMacDecoder, TrainSeq, detect_training_sequence
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,7 @@ class TetraDecoder:
         self.key_manager = key_manager
         self.auto_decrypt = auto_decrypt
         self.protocol_parser = TetraProtocolParser()  # Add protocol parser
+        self.lower_mac = LowerMacDecoder()
         self._setup_common_keys()
     
     def _setup_common_keys(self):
@@ -137,7 +139,7 @@ class TetraDecoder:
         
         logger.info(f"Loaded {len(self.user_keys)} user-provided encryption keys")
         
-    def symbols_to_bits(self, symbols):
+    def symbols_to_bits(self, symbols, *, swap_bits: bool = False):
         """
         Convert demodulated symbols to bits (2 bits per symbol).
         Handles both 0-7 (8-PSK) and 0-3 (π/4-DQPSK) input formats.
@@ -164,9 +166,46 @@ class TetraDecoder:
                 else: val = 0
             
             mapped_symbols.append(val)
-            bits.extend([val >> 1, val & 1])
+            if swap_bits:
+                bits.extend([val & 1, val >> 1])
+            else:
+                bits.extend([val >> 1, val & 1])
             
         return np.array(bits), np.array(mapped_symbols)
+
+    def _symbols_to_soft_bits(self, symbols: np.ndarray, confidences: np.ndarray, *, swap_bits: bool = False) -> np.ndarray:
+        """Convert symbols + confidence into soft bits."""
+        soft_bits: list[int] = []
+        max_symbol = np.max(symbols) if len(symbols) > 0 else 0
+        is_dqpsk = max_symbol <= 3
+
+        for idx, s in enumerate(symbols):
+            conf = float(confidences[idx]) if confidences is not None and idx < len(confidences) else 1.0
+            conf = max(0.0, min(conf, 1.0))
+            soft = int(1 + 126 * conf)
+            if is_dqpsk:
+                val = int(s) & 0x3
+            else:
+                if s in [0, 1, 2]:
+                    val = 0
+                elif s in [3, 4]:
+                    val = 1
+                elif s in [5]:
+                    val = 3
+                elif s in [6, 7]:
+                    val = 2
+                else:
+                    val = 0
+            if swap_bits:
+                bit0 = val & 1
+                bit1 = val >> 1
+            else:
+                bit0 = val >> 1
+                bit1 = val & 1
+            soft_bits.append(soft if bit0 == 0 else -soft)
+            soft_bits.append(soft if bit1 == 0 else -soft)
+
+        return np.array(soft_bits, dtype=np.int16)
     
     def find_sync(self, bits, threshold=0.85, return_max_corr=False):
         """
@@ -293,6 +332,47 @@ class TetraDecoder:
         if return_max_corr:
             return sync_positions, max_corr
         return sync_positions
+
+    def _sync_patterns_symbols(self, swap_bits: bool = False) -> list[np.ndarray]:
+        """Convert known sync patterns from bits to dibit symbols."""
+        patterns = []
+        for pattern in (self.protocol_parser.SYNC_CONTINUOUS_DOWNLINK, self.protocol_parser.SYNC_DISCONTINUOUS_DOWNLINK):
+            symbols = []
+            for i in range(0, len(pattern), 2):
+                if i + 1 >= len(pattern):
+                    break
+                if swap_bits:
+                    val = (pattern[i + 1] << 1) | pattern[i]
+                else:
+                    val = (pattern[i] << 1) | pattern[i + 1]
+                symbols.append(val)
+            if symbols:
+                patterns.append(np.array(symbols))
+        return patterns
+
+    def find_sync_symbols(self, symbols: np.ndarray, threshold: float = 0.8, swap_bits: bool = False):
+        """Find sync positions using symbol-level training sequences."""
+        if symbols is None or len(symbols) < 22:
+            return [], 0.0
+
+        patterns = self._sync_patterns_symbols(swap_bits=swap_bits)
+        if not patterns:
+            return [], 0.0
+
+        best_corr = 0.0
+        sync_positions = []
+        for pattern in patterns:
+            win = len(pattern)
+            if len(symbols) < win:
+                continue
+            for idx in range(0, len(symbols) - win + 1):
+                window = symbols[idx : idx + win]
+                match = float(np.sum(window == pattern)) / win
+                if match > best_corr:
+                    best_corr = match
+                if match >= threshold:
+                    sync_positions.append(idx * 2)  # convert to bit index
+        return sync_positions, best_corr
     
     def decode_frame(self, bits, start_pos, symbols=None):
         """
@@ -413,7 +493,7 @@ class TetraDecoder:
                 
                 # Parse MAC PDU even if CRC failed (may still be partially valid)
                 try:
-                    mac_pdu = self.protocol_parser.parse_mac_pdu(burst.data_bits)
+                    mac_pdu = self.protocol_parser.parse_mac_pdu(burst.data_bits, crc_ok=burst.crc_ok)
                     
                     if mac_pdu:
                         frame_data['mac_pdu'] = {
@@ -832,60 +912,133 @@ class TetraDecoder:
         
         return frame_data
     
-    def decode(self, symbols):
+    def decode(self, symbols, *, confidences: Optional[np.ndarray] = None):
         """
         Decode TETRA frames from symbol stream.
         """
-        # Convert symbols to bits and mapped symbols (0-3)
-        bits, mapped_symbols = self.symbols_to_bits(symbols)
-        
-        # Find synchronization patterns (Training Sequence)
-        # Use adaptive thresholding based on max correlation to avoid dropping frames
-        # The find_sync function now has built-in adaptive thresholding when max_corr is close to threshold
-        sync_positions, max_corr = self.find_sync(bits, threshold=0.90, return_max_corr=True)
-        
-        if not sync_positions:
-            # Try 0.85 threshold - find_sync will use adaptive threshold if max_corr is close
-            sync_positions, max_corr = self.find_sync(bits, threshold=0.85, return_max_corr=True)
-            if not sync_positions:
-                # Try 0.80 threshold - find_sync will use adaptive threshold if max_corr is close
-                sync_positions, max_corr = self.find_sync(bits, threshold=0.80, return_max_corr=True)
-                if not sync_positions and max_corr >= 0.75:
-                    # Last resort: use adaptive threshold based on max correlation
-                    adaptive_threshold = max(0.75, max_corr - 0.02)
-                    sync_positions, _ = self.find_sync(bits, threshold=adaptive_threshold, return_max_corr=True)
-                    # Do not go lower than 0.75 for 22-bit sync
-        
-        # Decode frames
-        frames = []
-        for pos in sync_positions:
-            # Adjust position to start of burst
-            # TS starts at bit 216 (symbol 108)
-            # But we need to be careful about array bounds
-            start_pos = pos - 216
-            
-            if start_pos >= 0:
-                # Extract symbols for this frame
-                # 255 symbols = 510 bits
-                start_sym = start_pos // 2
-                if start_sym + 255 <= len(mapped_symbols):
-                    frame_symbols = mapped_symbols[start_sym : start_sym + 255]
-                    
-                    # Reconstruct bits for decode_frame (it expects bits)
-                    # But decode_frame logic for header/type is based on bits
-                    # We pass the bits corresponding to the frame
-                    frame_bits = bits[start_pos : start_pos + 510]
-                    
-                    # Calculate a pseudo frame number based on position
-                    # Assuming continuous stream, 510 bits per timeslot
-                    current_frame_num = start_pos // 510
-                    
-                    frame = self.decode_frame(frame_bits, 0, frame_symbols, frame_number=current_frame_num)
-                    if frame:
-                        frames.append(frame)
-                        logger.info(f"Decoded frame {frame['number']} (type: {frame['type']})")
-        
+        if symbols is None or len(symbols) < 255:
+            return []
+
+        best_bits = None
+        best_symbols = None
+        best_score = -1
+        best_swap = False
+        best_rotation = 0
+
+        for rotation in range(4):
+            rotated = (symbols + rotation) % 4
+            for swap_bits in (False, True):
+                bits, mapped_symbols = self.symbols_to_bits(rotated, swap_bits=swap_bits)
+                score = self._score_training_sequences(bits)
+                if score > best_score:
+                    best_score = score
+                    best_bits = bits
+                    best_symbols = mapped_symbols
+                    best_swap = swap_bits
+                    best_rotation = rotation
+
+        if best_bits is None:
+            return []
+
+        bursts = self._extract_bursts(best_bits)
+        soft_bits = None
+        if confidences is not None and len(confidences) >= len(symbols):
+            rotated = (symbols + best_rotation) % 4
+            soft_bits = self._symbols_to_soft_bits(rotated, confidences, swap_bits=best_swap)
+        frames: list[dict] = []
+        frame_number = 0
+
+        for start_pos, train_seq in bursts:
+            burst_bits = best_bits[start_pos : start_pos + 510]
+            if soft_bits is not None and len(soft_bits) >= start_pos + 510:
+                burst_bits = soft_bits[start_pos : start_pos + 510]
+            blocks = self.lower_mac.decode_burst(burst_bits, train_seq)
+            if self.lower_mac.mcc is not None:
+                self.protocol_parser.mcc = self.lower_mac.mcc
+            if self.lower_mac.mnc is not None:
+                self.protocol_parser.mnc = self.lower_mac.mnc
+
+            for block in blocks:
+                frame_data = {
+                    "number": frame_number,
+                    "type": block.block_type.value,
+                    "type_name": block.block_type.value,
+                    "position": start_pos,
+                    "crc_ok": block.crc_ok,
+                    "scrambling_code": block.scrambling_code,
+                    "additional_info": {},
+                }
+                frame_number += 1
+
+                if block.type1_bits is not None:
+                    frame_data["bits"] = block.type1_bits.tolist()
+                if block.codec_input:
+                    frame_data["has_voice"] = True
+                    frame_data["codec_input"] = block.codec_input
+
+                if block.extra:
+                    frame_data["additional_info"].update(block.extra)
+                    if "mcc" in block.extra:
+                        frame_data["mcc"] = block.extra["mcc"]
+                    if "mnc" in block.extra:
+                        frame_data["mnc"] = block.extra["mnc"]
+
+                if block.type1_bits is not None and block.block_type in (BlockType.NDB, BlockType.SCH_F, BlockType.SB2):
+                    mac_pdu = self.protocol_parser.parse_mac_pdu(block.type1_bits, crc_ok=block.crc_ok)
+                    if mac_pdu:
+                        frame_data["mac_pdu"] = {
+                            "type": mac_pdu.pdu_type.name,
+                            "encrypted": mac_pdu.encrypted,
+                            "address": mac_pdu.address,
+                            "length": mac_pdu.length,
+                            "data": mac_pdu.data,
+                        }
+                        if mac_pdu.extra:
+                            frame_data["mac_pdu_extra"] = mac_pdu.extra
+                        frame_data["encrypted"] = mac_pdu.encrypted
+
+                        call_meta = self.protocol_parser.parse_call_metadata(mac_pdu)
+                        if call_meta:
+                            frame_data["call_metadata"] = {
+                                "call_type": call_meta.call_type,
+                                "talkgroup_id": call_meta.talkgroup_id,
+                                "source_ssi": call_meta.source_ssi,
+                                "dest_ssi": call_meta.dest_ssi,
+                                "channel": call_meta.channel_allocated,
+                                "encryption": call_meta.encryption_enabled,
+                                "encryption_alg": call_meta.encryption_algorithm,
+                                "mcc": call_meta.mcc,
+                                "mnc": call_meta.mnc,
+                            }
+
+                frames.append(frame_data)
+
         return frames
+
+    def _score_training_sequences(self, bits: np.ndarray) -> int:
+        matches = 0
+        idx = 0
+        max_len = min(len(bits), 510 * 12)
+        while idx + 510 <= max_len:
+            ts, corr = detect_training_sequence(bits, idx)
+            if ts != TrainSeq.UNKNOWN and corr >= 0.75:
+                matches += 1
+                idx += 510
+            else:
+                idx += 2
+        return matches
+
+    def _extract_bursts(self, bits: np.ndarray) -> list[tuple[int, TrainSeq]]:
+        bursts: list[tuple[int, TrainSeq]] = []
+        idx = 0
+        while idx + 510 <= len(bits):
+            ts, corr = detect_training_sequence(bits, idx)
+            if ts != TrainSeq.UNKNOWN and corr >= 0.75:
+                bursts.append((idx, ts))
+                idx += 510
+            else:
+                idx += 2
+        return bursts
 
     def decode_frame(self, bits, start_pos, symbols=None, frame_number=0):
         """
@@ -993,7 +1146,7 @@ class TetraDecoder:
                 
                 # Parse MAC PDU even if CRC failed (may still be partially valid)
                 try:
-                    mac_pdu = self.protocol_parser.parse_mac_pdu(burst.data_bits)
+                    mac_pdu = self.protocol_parser.parse_mac_pdu(burst.data_bits, crc_ok=burst.crc_ok)
                     
                     if mac_pdu:
                         frame_data['mac_pdu'] = {

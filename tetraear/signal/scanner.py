@@ -169,7 +169,7 @@ class TetraSignalDetector:
             
             # Try to decode frames
             decoder = TetraDecoder(auto_decrypt=False)  # Don't try decryption for validation
-            frames = decoder.decode(demodulated)
+            frames = decoder.decode(demodulated, confidences=processor.symbol_confidence)
             
             if len(frames) == 0:
                 return False, 0.0

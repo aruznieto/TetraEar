@@ -27,8 +27,13 @@ import logging
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass
 from enum import Enum
+from collections import Counter
 
 logger = logging.getLogger(__name__)
+
+
+MACPDU_LEN_2ND_STOLEN = -2
+MACPDU_LEN_START_FRAG = -1
 
 
 class BurstType(Enum):
@@ -117,9 +122,13 @@ class MacPDU:
     address: Optional[int]
     length: int
     data: bytes
+    data_bits: Optional[np.ndarray] = None
+    tm_sdu_bits: Optional[np.ndarray] = None
     fill_bits: int = 0
     encryption_mode: int = 0  # 0=Clear, 1=Class2, 2=Class3, 3=Reserved
     reassembled_data: Optional[bytes] = None  # For fragmented messages
+    crc_ok: Optional[bool] = None
+    extra: Optional[dict] = None
     
 
 @dataclass
@@ -188,6 +197,27 @@ class TetraProtocolParser:
         # Fragmentation handling
         self.fragment_buffer = bytearray()
         self.fragment_metadata = {}
+        self._network_votes: Counter[tuple[int, int, int]] = Counter()
+        self._llc_defrag: Dict[int, Dict[str, object]] = {}
+        self._mac_frag_active = False
+        self._mac_frag_bits: Optional[np.ndarray] = None
+        self._mac_frag_extra: Dict[str, object] = {}
+        self._ssi_votes: Counter[int] = Counter()
+
+    def _record_network_candidate(self, mcc: int, mnc: int, colour_code: int, *, strong: bool) -> None:
+        """Record MCC/MNC candidates and only lock in after repeats unless strong."""
+        if strong:
+            self.mcc = mcc
+            self.mnc = mnc
+            self.colour_code = colour_code
+            return
+
+        key = (mcc, mnc, colour_code)
+        self._network_votes[key] += 1
+        if self._network_votes[key] >= 3:
+            self.mcc = mcc
+            self.mnc = mnc
+            self.colour_code = colour_code
         
     def parse_burst(self, symbols: np.ndarray, slot_number: int = 0) -> Optional[TetraBurst]:
         """
@@ -266,24 +296,30 @@ class TetraProtocolParser:
     
     def _extract_training_sequence(self, bits: np.ndarray, burst_type: BurstType) -> np.ndarray:
         """Extract training sequence from burst."""
-        # Training sequence is typically in the middle of the burst
+        # Training sequence is typically in the middle of the burst.
+        # Use 11 symbols (22 bits) for normal/sync bursts based on TS length.
+        training_len_bits = 22
         if burst_type == BurstType.Synchronization:
-            # Sync burst: training at position ~108
-            return bits[108:130]
+            # Sync burst: training at position ~108 symbols -> 216 bits
+            start = 216
         else:
-            # Normal burst: training at position ~108
-            return bits[108:122]
+            # Normal burst: training at position ~108 symbols -> 216 bits
+            start = 216
+        end = min(len(bits), start + training_len_bits)
+        return bits[start:end]
     
     def _extract_data_bits(self, bits: np.ndarray, burst_type: BurstType) -> np.ndarray:
         """Extract data bits from burst (excluding training and tail)."""
-        # Normal burst: 216 bits (2 x 108) excluding training sequence
+        # Normal burst: 432 bits (2 x 108 symbols) excluding training sequence
         if burst_type == BurstType.NormalDownlink or burst_type == BurstType.NormalUplink:
-            # First block: bits 0-107
-            # Training: bits 108-121
-            # Second block: bits 122-229
-            # Tail: bits 230+
-            first_block = bits[0:108]
-            second_block = bits[122:230]
+            # First block: 108 symbols = 216 bits
+            # Training: 11 symbols = 22 bits
+            # Second block: 108 symbols = 216 bits
+            first_end = 108 * 2
+            training_end = first_end + 11 * 2
+            second_end = training_end + 108 * 2
+            first_block = bits[0:first_end]
+            second_block = bits[training_end:second_end]
             return np.concatenate([first_block, second_block])
         
         # For other burst types, return all bits
@@ -346,29 +382,163 @@ class TetraProtocolParser:
         crc_bits = [(crc >> i) & 1 for i in range(15, -1, -1)]
         return np.array(crc_bits)
     
-    def parse_mac_pdu(self, bits: np.ndarray) -> Optional[MacPDU]:
+    def parse_mac_pdu(self, bits: np.ndarray, *, crc_ok: Optional[bool] = None) -> Optional[MacPDU]:
         """
         Parse MAC layer PDU.
         Handles fragmentation (MAC-RESOURCE, MAC-FRAG, MAC-END).
         
         Args:
             bits: Data bits from burst
+            crc_ok: Optional CRC validity for the burst carrying this PDU
             
         Returns:
             Parsed MacPDU or None
         """
-        if len(bits) < 8:
+        if bits is None or len(bits) < 8:
             return None
-        
-        # MAC PDU Type (first 2 bits for Downlink)
-        # 00: MAC-RESOURCE
-        # 01: MAC-FRAG
-        # 10: MAC-BROADCAST
-        # 11: MAC-ENCRYPTED (or other, depending on context)
-        
-        pdu_type_int = (bits[0] << 1) | bits[1]
-        
-        # Map to internal Enum
+
+        if not isinstance(bits, np.ndarray):
+            bits = np.array(bits, dtype=np.int16)
+        else:
+            bits = bits.astype(np.int16, copy=False)
+
+        if np.any((bits != 0) & (bits != 1)):
+            bits = (bits < 0).astype(np.uint8)
+        else:
+            bits = bits.astype(np.uint8, copy=False)
+
+        def _bits_to_uint(bit_arr: np.ndarray, start: int, length: int) -> int:
+            val = 0
+            end = min(start + length, len(bit_arr))
+            for bit in bit_arr[start:end]:
+                val = (val << 1) | (int(bit) & 1)
+            return val
+
+        def _bits_to_bytes(bit_arr: np.ndarray) -> bytes:
+            if bit_arr is None or len(bit_arr) == 0:
+                return b""
+            out = bytearray()
+            for i in range(0, len(bit_arr), 8):
+                chunk = bit_arr[i : i + 8]
+                if len(chunk) < 8:
+                    chunk = np.pad(chunk, (0, 8 - len(chunk)))
+                val = 0
+                for bit in chunk:
+                    val = (val << 1) | (int(bit) & 1)
+                out.append(val)
+            return bytes(out)
+
+        def _decode_length(length_ind: int) -> Optional[int]:
+            if length_ind in (0x00, 0x3B, 0x3C):
+                return None
+            if length_ind <= 0x12:
+                return length_ind
+            if length_ind <= 0x3A:
+                return 18 + (length_ind - 18)
+            if length_ind == 0x3E:
+                return MACPDU_LEN_2ND_STOLEN
+            if length_ind == 0x3F:
+                return MACPDU_LEN_START_FRAG
+            return None
+
+        def _get_num_fill_bits(bit_arr: np.ndarray, length: int) -> int:
+            for i in range(1, length + 1):
+                if bit_arr[length - i] == 1:
+                    return i
+            return 0
+
+        def _parse_chan_alloc(bit_arr: np.ndarray, start: int) -> tuple[dict, int]:
+            cur = start
+            info: dict = {}
+            if cur + 2 > len(bit_arr):
+                return info, 0
+            info["alloc_type"] = _bits_to_uint(bit_arr, cur, 2); cur += 2
+            if cur + 4 > len(bit_arr):
+                return info, cur - start
+            info["timeslot"] = _bits_to_uint(bit_arr, cur, 4); cur += 4
+            if cur + 2 > len(bit_arr):
+                return info, cur - start
+            info["ul_dl"] = _bits_to_uint(bit_arr, cur, 2); cur += 2
+            if cur + 1 > len(bit_arr):
+                return info, cur - start
+            info["clch_perm"] = int(bit_arr[cur]); cur += 1
+            if cur + 1 > len(bit_arr):
+                return info, cur - start
+            info["cell_chg"] = int(bit_arr[cur]); cur += 1
+            if cur + 12 > len(bit_arr):
+                return info, cur - start
+            info["carrier"] = _bits_to_uint(bit_arr, cur, 12); cur += 12
+
+            if cur >= len(bit_arr):
+                return info, cur - start
+            ext_carr_pres = int(bit_arr[cur]); cur += 1
+            info["ext_carr_pres"] = ext_carr_pres
+            if ext_carr_pres:
+                if cur + 4 > len(bit_arr):
+                    return info, cur - start
+                info["freq_band"] = _bits_to_uint(bit_arr, cur, 4); cur += 4
+                if cur + 2 > len(bit_arr):
+                    return info, cur - start
+                info["freq_offset"] = _bits_to_uint(bit_arr, cur, 2); cur += 2
+                if cur + 3 > len(bit_arr):
+                    return info, cur - start
+                info["duplex_spacing"] = _bits_to_uint(bit_arr, cur, 3); cur += 3
+                if cur + 1 > len(bit_arr):
+                    return info, cur - start
+                info["reverse_operation"] = int(bit_arr[cur]); cur += 1
+
+            if cur + 2 > len(bit_arr):
+                return info, cur - start
+            monit_pattern = _bits_to_uint(bit_arr, cur, 2); cur += 2
+            info["monit_pattern"] = monit_pattern
+            if monit_pattern == 0 and cur + 2 <= len(bit_arr):
+                info["monit_patt_f18"] = _bits_to_uint(bit_arr, cur, 2)
+                cur += 2
+
+            if info.get("ul_dl") == 0:
+                if cur + 2 > len(bit_arr):
+                    return info, cur - start
+                info["ul_dl_ass"] = _bits_to_uint(bit_arr, cur, 2); cur += 2
+                if cur + 3 > len(bit_arr):
+                    return info, cur - start
+                info["bandwidth"] = _bits_to_uint(bit_arr, cur, 3); cur += 3
+                if cur + 3 > len(bit_arr):
+                    return info, cur - start
+                info["modulation"] = _bits_to_uint(bit_arr, cur, 3); cur += 3
+                if cur + 3 > len(bit_arr):
+                    return info, cur - start
+                info["max_ul_qam"] = _bits_to_uint(bit_arr, cur, 3); cur += 3
+                cur += 3  # reserved
+                if cur + 3 > len(bit_arr):
+                    return info, cur - start
+                info["conf_chan_stat"] = _bits_to_uint(bit_arr, cur, 3); cur += 3
+                if cur + 4 > len(bit_arr):
+                    return info, cur - start
+                info["bs_imbalance"] = _bits_to_uint(bit_arr, cur, 4); cur += 4
+                if cur + 5 > len(bit_arr):
+                    return info, cur - start
+                info["bs_tx_rel"] = _bits_to_uint(bit_arr, cur, 5); cur += 5
+                if cur + 2 > len(bit_arr):
+                    return info, cur - start
+                napping = _bits_to_uint(bit_arr, cur, 2); cur += 2
+                info["napping_sts"] = napping
+                if napping == 1:
+                    cur += 11
+                cur += 4
+                if cur < len(bit_arr):
+                    if bit_arr[cur]:
+                        cur += 1 + 16
+                    else:
+                        cur += 1
+                if cur < len(bit_arr):
+                    if bit_arr[cur]:
+                        cur += 1 + 16
+                    else:
+                        cur += 1
+                cur += 1
+            return info, cur - start
+
+        pdu_type_int = _bits_to_uint(bits, 0, 2)
         if pdu_type_int == 0:
             pdu_type = PDUType.MAC_RESOURCE
         elif pdu_type_int == 1:
@@ -376,224 +546,713 @@ class TetraProtocolParser:
         elif pdu_type_int == 2:
             pdu_type = PDUType.MAC_BROADCAST
         else:
-            # Type 3 is often MAC-END or MAC-U-SIGNAL depending on context/uplink/downlink
-            # For Downlink, 11 is often reserved or proprietary, or MAC-D-BLCK
-            # Let's assume MAC-END for now if it fits the structure
-            pdu_type = PDUType.MAC_END
+            pdu_type = PDUType.MAC_SUPPL
 
-        # Encryption Mode (Bits 2-3)
-        # 00: Class 1 (Clear)
-        # 01: Class 2 (SCK)
-        # 10: Class 3 (DCK)
-        # 11: Reserved
-        encryption_mode_val = (bits[2] << 1) | bits[3]
-        encrypted = encryption_mode_val > 0
-        
-        # Default fields
+        encrypted = False
         address = None
         length = 0
-        data_bytes = b''
-        fill_bit_ind = 0
-        
-        # Parse based on PDU Type
+        data_bytes = b""
+        data_bits = None
+        tm_sdu_bits = None
+        extra: dict = {}
+
+        addr_len_by_type = {
+            1: 24,
+            2: 10,
+            3: 24,
+            4: 24,
+            5: 34,
+            6: 30,
+            7: 34,
+        }
+
         if pdu_type == PDUType.MAC_RESOURCE:
-            # MAC-RESOURCE
-            # Bits: Type(2), EncMode(2), Fill(1), ...
-            fill_bit_ind = bits[4]
-            
-            # Position pointer
-            pos = 5
-            
-            # Encryption (already parsed mode)
-            
-            # Address (24 bits)
-            if len(bits) >= pos + 24:
-                address_bits = bits[pos:pos+24]
-                address = int(''.join(str(b) for b in address_bits), 2)
-                pos += 24
+            cur = 2
+            fill_bits = _bits_to_uint(bits, cur, 1); cur += 1
+            grant_position = _bits_to_uint(bits, cur, 1); cur += 1
+            encryption_mode = _bits_to_uint(bits, cur, 2); cur += 2
+            encrypted = encryption_mode > 0
+            rand_acc_flag = int(bits[cur]) if cur < len(bits) else 0; cur += 1
+            length_ind = _bits_to_uint(bits, cur, 6); cur += 6
+            addr_type = _bits_to_uint(bits, cur, 3); cur += 3
+
+            addr_len = addr_len_by_type.get(addr_type, 0)
+            usage_marker = None
+            if addr_len >= 24 and cur + 24 <= len(bits):
+                address = _bits_to_uint(bits, cur, 24)
+                if addr_type == 6 and cur + 30 <= len(bits):
+                    usage_marker = _bits_to_uint(bits, cur + 24, 6)
+            elif addr_len == 10 and cur + 10 <= len(bits):
+                address = _bits_to_uint(bits, cur, 10)
+            cur += addr_len
+
+            if cur < len(bits):
+                power_control_pres = int(bits[cur]); cur += 1
+                if power_control_pres:
+                    cur += 4
+            if cur < len(bits):
+                slot_granting_pres = int(bits[cur]); cur += 1
+                if slot_granting_pres:
+                    cur += 8
+            if cur < len(bits):
+                chan_alloc_pres = int(bits[cur]); cur += 1
+                if chan_alloc_pres:
+                    alloc_info, consumed = _parse_chan_alloc(bits, cur)
+                    if consumed:
+                        cur += consumed
+                        extra.update(alloc_info)
+
+            extra.update({
+                "fill_bits": fill_bits,
+                "grant_position": grant_position,
+                "rand_acc_flag": rand_acc_flag,
+                "encryption_mode": encryption_mode,
+                "length_ind": length_ind,
+                "addr_type": addr_type,
+                "usage_marker": usage_marker,
+            })
+            extra["address"] = address
+            if address is not None:
+                extra["ssi"] = address
+
+            mac_len = _decode_length(length_ind)
+            tm_sdu_len = None
+            if mac_len is not None and mac_len >= 0:
+                tm_sdu_len = mac_len * 8
+            elif mac_len == MACPDU_LEN_2ND_STOLEN:
+                extra["blk2_stolen"] = True
+            elif mac_len == MACPDU_LEN_START_FRAG:
+                extra["start_frag"] = True
+
+            if tm_sdu_len is not None:
+                end = min(len(bits), cur + tm_sdu_len)
             else:
-                return None # Truncated
-            
-            # Length (6 bits)
-            if len(bits) >= pos + 6:
-                length_bits = bits[pos:pos+6]
-                length = int(''.join(str(b) for b in length_bits), 2)
-                pos += 6
-            else:
-                return None # Truncated
-                
-            # Data
-            # If length is 0, it might mean "rest of slot" or specific rule
-            # Standard says: Length indicator 000000 means Null PDU or similar?
-            # Actually, length is in octets (bytes) usually.
-            
-            data_len_bits = length * 8
-            
-            # STRICT CHECK: Data length cannot exceed remaining bits significantly
-            if data_len_bits > len(bits) - pos + 16: # Allow small margin
-                return None
-            
-            if data_len_bits > 0 and len(bits) >= pos + data_len_bits:
-                data_bits = bits[pos:pos + data_len_bits]
-            else:
-                data_bits = bits[pos:]
-                
-            try:
-                data_bytes = BitArray(data_bits).tobytes()
-            except:
-                data_bytes = b''
-                
-            # Start fragmentation buffer
-            # Only start if this looks like the beginning of a message
-            self.fragment_buffer = bytearray(data_bytes)
-            self.fragment_metadata = {'address': address, 'encrypted': encrypted, 'mode': encryption_mode_val}
-            
-        elif pdu_type == PDUType.MAC_FRAG:
-            # MAC-FRAG
-            # Bits: Type(2), EncMode(2), Fill(1), ...
-            fill_bit_ind = bits[4]
-            pos = 5
-            
-            data_bits = bits[pos:]
-            try:
-                data_bytes = BitArray(data_bits).tobytes()
-            except:
-                data_bytes = b''
-                
-            # Append to buffer
-            self.fragment_buffer.extend(data_bytes)
-            
-            # Restore metadata
-            if self.fragment_metadata:
-                encrypted = self.fragment_metadata.get('encrypted', False)
-                address = self.fragment_metadata.get('address')
-            
-        elif pdu_type == PDUType.MAC_BROADCAST:
-            # MAC-BROADCAST
-            # Bits: Type(2), BroadcastType(2), ...
-            # BroadcastType: 00=SYSINFO, 01=ACCESS-DEFINE, ...
-            broadcast_type = (bits[2] << 1) | bits[3]
-            
-            pos = 4
-            # SYSINFO (Type 0)
-            if broadcast_type == 0:
-                # Parse SYSINFO elements
-                # MCC(10), MNC(14), CC(6), ...
-                if len(bits) >= pos + 30:
-                    self.mcc = int(''.join(str(b) for b in bits[pos:pos+10]), 2)
-                    self.mnc = int(''.join(str(b) for b in bits[pos+10:pos+24]), 2)
-                    self.colour_code = int(''.join(str(b) for b in bits[pos+24:pos+30]), 2)
-                    
-                    # STRICT CHECK: MCC/MNC sanity - Real TETRA networks
-                    # MCC must be 200-799 (valid ITU-T E.212 range)
-                    if self.mcc < 200 or self.mcc > 799:
-                        logger.debug(f"Invalid MCC {self.mcc} in SYNC - not real TETRA")
-                        return None
-                    if self.mnc > 999:
-                        logger.debug(f"Invalid MNC {self.mnc} in SYNC - not real TETRA")
-                        return None
-                    
-                    logger.info(f"Valid TETRA SYNC: MCC={self.mcc} MNC={self.mnc}")
+                end = len(bits)
+                if fill_bits and end > 0:
+                    end = max(cur, end - _get_num_fill_bits(bits[:end], end))
+
+            tm_sdu_bits = bits[cur:end] if end > cur else None
+            if mac_len == MACPDU_LEN_START_FRAG:
+                self._mac_frag_active = True
+                if tm_sdu_bits is not None and len(tm_sdu_bits) > 0:
+                    self._mac_frag_bits = np.array(tm_sdu_bits, copy=True)
                 else:
-                    return None
-            
-            data_bits = bits[pos:]
-            try:
-                data_bytes = BitArray(data_bits).tobytes()
-            except:
-                data_bytes = b''
-                
+                    self._mac_frag_bits = np.array([], dtype=np.uint8)
+                self._mac_frag_extra = {"address": address, **extra}
+                tm_sdu_bits = None
+            data_bits = tm_sdu_bits
+            data_bytes = _bits_to_bytes(data_bits)
+            length = len(data_bytes)
+            self.fragment_buffer = bytearray(data_bytes)
+            self.fragment_metadata = {"address": address, "encrypted": encrypted}
+            extra["tm_sdu_bits"] = tm_sdu_bits
+
+        elif pdu_type == PDUType.MAC_BROADCAST:
+            broadcast_type = _bits_to_uint(bits, 2, 2)
+            extra["broadcast_type"] = broadcast_type
+            data_bits = bits[4:]
+            data_bytes = _bits_to_bytes(data_bits)
+            length = len(data_bytes)
+
+        elif pdu_type == PDUType.MAC_FRAG:
+            frag_end_flag = _bits_to_uint(bits, 2, 1)
+            fillbits_present = _bits_to_uint(bits, 3, 1)
+            cur = 4
+
+            if frag_end_flag == 0:
+                # MAC-FRAG continuation
+                end = len(bits)
+                if fillbits_present and end > 0:
+                    end = max(cur, end - _get_num_fill_bits(bits[:end], end))
+                frag_bits = bits[cur:end] if end > cur else None
+                if frag_bits is not None and len(frag_bits) > 0:
+                    if not self._mac_frag_active:
+                        self._mac_frag_active = True
+                        self._mac_frag_bits = np.array(frag_bits, copy=True)
+                    elif self._mac_frag_bits is None or np.size(self._mac_frag_bits) == 0:
+                        self._mac_frag_bits = np.array(frag_bits, copy=True)
+                    else:
+                        self._mac_frag_bits = np.concatenate([self._mac_frag_bits, frag_bits])
+                extra.update({"frag_end": False, "fill_bits": fillbits_present})
+                tm_sdu_bits = None
+                data_bits = frag_bits
+                data_bytes = _bits_to_bytes(frag_bits) if frag_bits is not None else b""
+                length = len(data_bytes)
+            else:
+                # MAC-END, includes length indicator and optional chan alloc
+                position_of_grant = _bits_to_uint(bits, cur, 1); cur += 1
+                length_ind = _bits_to_uint(bits, cur, 6); cur += 6
+                slot_granting = _bits_to_uint(bits, cur, 1); cur += 1
+                if slot_granting and cur + 8 <= len(bits):
+                    cur += 8
+                chan_alloc_pres = _bits_to_uint(bits, cur, 1) if cur < len(bits) else 0
+                cur += 1 if cur < len(bits) else 0
+                if chan_alloc_pres:
+                    alloc_info, consumed = _parse_chan_alloc(bits, cur)
+                    if consumed:
+                        cur += consumed
+                        extra.update(alloc_info)
+
+                tm_sdu_len = length_ind * 8 if length_ind else None
+                end = len(bits)
+                if tm_sdu_len is not None and tm_sdu_len > 0:
+                    end = min(end, cur + tm_sdu_len)
+                if fillbits_present and end > 0:
+                    end = max(cur, end - _get_num_fill_bits(bits[:end], end))
+                frag_bits = bits[cur:end] if end > cur else None
+
+                if self._mac_frag_active and self._mac_frag_bits is not None and frag_bits is not None:
+                    tm_sdu_bits = np.concatenate([self._mac_frag_bits, frag_bits])
+                    self._mac_frag_active = False
+                    self._mac_frag_bits = None
+                    if self._mac_frag_extra:
+                        if address is None:
+                            address = self._mac_frag_extra.get("address")
+                        extra = {**self._mac_frag_extra, **extra}
+                        self._mac_frag_extra = {}
+                else:
+                    tm_sdu_bits = frag_bits
+
+                data_bits = tm_sdu_bits
+                data_bytes = _bits_to_bytes(data_bits) if data_bits is not None else b""
+                length = len(data_bytes)
+                extra.update({
+                    "frag_end": True,
+                    "fill_bits": fillbits_present,
+                    "position_of_grant": position_of_grant,
+                    "length_ind": length_ind,
+                    "slot_granting": slot_granting,
+                })
+
         else:
-            # Fallback / MAC-END
-            # Bits: Type(2), EncMode(2), Fill(1), Length(6)?
-            # MAC-END usually has structure: Type(2), EncMode(2), Fill(1), Length(6)
-            fill_bit_ind = bits[4]
-            pos = 5
-            
-            # Assuming Length is present for MAC-END
-            if len(bits) >= pos + 6:
-                length_bits = bits[pos:pos+6]
-                length = int(''.join(str(b) for b in length_bits), 2)
-                pos += 6
-            else:
-                # If no length field, treat as invalid for MAC-END
-                return None
-                
-            data_len_bits = length * 8
-            
-            # STRICT CHECK
-            if data_len_bits > len(bits) - pos + 16:
-                return None
-                
-            if data_len_bits > 0 and len(bits) >= pos + data_len_bits:
-                data_bits = bits[pos:pos + data_len_bits]
-            else:
-                data_bits = bits[pos:]
-                
-            try:
-                data_bytes = BitArray(data_bits).tobytes()
-            except:
-                data_bytes = b''
-                
-            # Append and Finalize
-            self.fragment_buffer.extend(data_bytes)
-            
-            # Restore metadata
-            if self.fragment_metadata:
-                encrypted = self.fragment_metadata.get('encrypted', False)
-                address = self.fragment_metadata.get('address')
+            data_bits = bits[2:]
+            data_bytes = _bits_to_bytes(data_bits)
+            length = len(data_bytes)
 
         if encrypted:
             self.stats['encrypted_frames'] += 1
         else:
             self.stats['clear_mode_frames'] += 1
-        
-        # Create PDU
+
         pdu = MacPDU(
             pdu_type=pdu_type,
             encrypted=encrypted,
             address=address,
             length=length,
             data=data_bytes,
-            fill_bits=fill_bit_ind,
-            encryption_mode=encryption_mode_val
+            data_bits=data_bits,
+            tm_sdu_bits=tm_sdu_bits,
+            crc_ok=crc_ok,
+            extra=extra or None,
         )
-        
-        # Attach reassembled data if this is the end
-        # Logic:
-        # 1. MAC-RESOURCE with full length (no fragmentation) -> Single packet
-        # 2. MAC-END -> End of fragmentation chain
-        
-        # Check if MAC-RESOURCE is self-contained (not fragmented)
-        # Usually indicated by a flag or context, but here we assume if it's MAC-RESOURCE
-        # and we don't see a "More Bit" (which we haven't parsed yet), it might be single.
-        # BUT, standard says MAC-RESOURCE starts a transaction.
-        # If we treat every MAC-RESOURCE as start of buffer, and MAC-END as end.
-        
-        if pdu_type == PDUType.MAC_END:
-             if self.fragment_buffer:
-                pdu.reassembled_data = bytes(self.fragment_buffer)
-                if self.fragment_metadata:
-                    if not pdu.address: pdu.address = self.fragment_metadata.get('address')
-                    # Inherit encryption from start of chain
-                    pdu.encrypted = self.fragment_metadata.get('encrypted', False)
-                
-                # Clear buffer
-                self.fragment_buffer = bytearray()
-                self.fragment_metadata = {}
-        
-        elif pdu_type == PDUType.MAC_RESOURCE:
-            # If this is a single-slot message (no fragmentation), we should treat it as such.
-            # However, without parsing the "More Bit" (TM-SDU header), we can't be sure.
-            # Heuristic: If length is small enough to fit in slot and we don't see MAC-FRAG next...
-            # Better: Always expose current data, but also expose reassembled if MAC-END.
-            # For MAC-RESOURCE, we just started the buffer. If it's a short message, 
-            # it might be the whole message.
-            # Let's tentatively set reassembled_data to current data for MAC-RESOURCE
-            # so single-frame messages work.
-            pdu.reassembled_data = bytes(data_bytes)
-            
+
+        pdu.reassembled_data = bytes(data_bytes) if data_bytes else None
         return pdu
+
+    @staticmethod
+    def _is_valid_ssi(value: Optional[int]) -> bool:
+        """Validate a 24-bit SSI/GSSI value."""
+        if value is None:
+            return False
+        return 0 < value < 0xFFFFFF and value != 0xFFFFFF
+
+    def _resource_talkgroup(self, resource: dict) -> Optional[int]:
+        """Extract SSI/GSSI from resource address if applicable."""
+        if not resource:
+            return None
+        addr_type = resource.get("addr_type")
+        if addr_type in (0, 2):
+            return None
+        talkgroup = resource.get("ssi") or resource.get("address")
+        if not self._is_valid_ssi(talkgroup):
+            return None
+        return talkgroup
+
+    @staticmethod
+    def _bits_to_uint(bit_arr: np.ndarray, start: int, length: int, *, lsb: bool = False) -> int:
+        """Convert a slice of bits into an integer (MSB-first by default)."""
+        val = 0
+        end = min(start + length, len(bit_arr))
+        if lsb:
+            shift = 0
+            for bit in bit_arr[start:end]:
+                val |= (int(bit) & 1) << shift
+                shift += 1
+        else:
+            for bit in bit_arr[start:end]:
+                val = (val << 1) | (int(bit) & 1)
+        return val
+
+    def _llc_defrag_add(self, ns: int, ss: int, payload: np.ndarray, final_ss: Optional[int]) -> Optional[np.ndarray]:
+        entry = self._llc_defrag.get(ns)
+        if entry is None:
+            entry = {"segments": {}, "final": None}
+            self._llc_defrag[ns] = entry
+        segments: Dict[int, np.ndarray] = entry["segments"]  # type: ignore[assignment]
+        segments[ss] = np.array(payload, copy=True)
+        if final_ss is not None:
+            entry["final"] = final_ss
+
+        final = entry["final"]
+        if final is None:
+            return None
+        if not all(idx in segments for idx in range(final + 1)):
+            return None
+        assembled = np.concatenate([segments[idx] for idx in range(final + 1)])
+        del self._llc_defrag[ns]
+        return assembled
+
+    def _parse_llc_pdu(self, bits: np.ndarray) -> Optional[np.ndarray]:
+        """Parse LLC PDU and return TL-SDU bits if available."""
+        if bits is None or len(bits) < 4:
+            return None
+        if np.any((bits != 0) & (bits != 1)):
+            bits = (bits < 0).astype(np.uint8)
+        else:
+            bits = bits.astype(np.uint8, copy=False)
+
+        def bits_to_uint(start: int, length: int) -> int:
+            val = 0
+            end = min(start + length, len(bits))
+            for bit in bits[start:end]:
+                val = (val << 1) | (int(bit) & 1)
+            return val
+
+        pdu_type = bits_to_uint(0, 4)
+        cur = 4
+        tl_sdu_bits = None
+        ss = 0
+        ns = 0
+        final_ss = None
+
+        if pdu_type in (0, 4):  # BL-ADATA / BL-ADATA-FCS
+            if cur + 2 > len(bits):
+                return None
+            cur += 2  # NR + NS
+            tl_sdu_bits = bits[cur:]
+            if pdu_type == 4 and len(tl_sdu_bits) >= 32:
+                tl_sdu_bits = tl_sdu_bits[:-32]
+        elif pdu_type in (1, 5):  # BL-DATA / BL-DATA-FCS
+            if cur + 1 > len(bits):
+                return None
+            cur += 1  # NS
+            tl_sdu_bits = bits[cur:]
+            if pdu_type == 5 and len(tl_sdu_bits) >= 32:
+                tl_sdu_bits = tl_sdu_bits[:-32]
+        elif pdu_type in (2, 6):  # BL-UDATA / BL-UDATA-FCS
+            tl_sdu_bits = bits[cur:]
+            if pdu_type == 6 and len(tl_sdu_bits) >= 32:
+                tl_sdu_bits = tl_sdu_bits[:-32]
+        elif pdu_type in (3, 7):  # BL-ACK / BL-ACK-FCS
+            if cur + 1 > len(bits):
+                return None
+            cur += 1  # NR
+            tl_sdu_bits = bits[cur:]
+            if pdu_type == 7 and len(tl_sdu_bits) >= 32:
+                tl_sdu_bits = tl_sdu_bits[:-32]
+        elif pdu_type == 9:  # AL-DATA/FINAL
+            if cur + 1 > len(bits):
+                return None
+            final = bits[cur]
+            cur += 1
+            if final:
+                if cur + 1 + 3 + 8 > len(bits):
+                    return None
+                cur += 1  # AL_FINAL_AR
+                ns = bits_to_uint(cur, 3); cur += 3
+                ss = bits_to_uint(cur, 8); cur += 8
+                final_ss = ss
+                tl_sdu_bits = bits[cur:]
+            else:
+                if cur + 3 + 8 > len(bits):
+                    return None
+                ns = bits_to_uint(cur, 3); cur += 3
+                ss = bits_to_uint(cur, 8); cur += 8
+                tl_sdu_bits = bits[cur:]
+        elif pdu_type == 10:  # AL-UDATA/UFINAL
+            if cur + 1 > len(bits):
+                return None
+            final = bits[cur]
+            cur += 1
+            if cur + 8 + 8 > len(bits):
+                return None
+            ns = bits_to_uint(cur, 8); cur += 8
+            ss = bits_to_uint(cur, 8); cur += 8
+            tl_sdu_bits = bits[cur:]
+            if final:
+                final_ss = ss
+        else:
+            return None
+
+        if tl_sdu_bits is None or len(tl_sdu_bits) == 0:
+            return None
+        if pdu_type in (9, 10):
+            assembled = self._llc_defrag_add(ns, ss, tl_sdu_bits, final_ss)
+            return assembled
+        if ss != 0:
+            return None
+        return tl_sdu_bits
+
+    def _parse_cmce_metadata(self, mac_pdu: MacPDU) -> Optional[CallMetadata]:
+        """Parse CMCE call metadata from TM-SDU bits."""
+        tm_sdu_bits = mac_pdu.tm_sdu_bits
+        if tm_sdu_bits is None or mac_pdu.extra is None:
+            return None
+        tl_sdu_bits = self._parse_llc_pdu(tm_sdu_bits)
+        if tl_sdu_bits is None or len(tl_sdu_bits) < 8:
+            return None
+        mle_pdisc = self._bits_to_uint(tl_sdu_bits, 0, 3)
+        use_lsb = False
+        if mle_pdisc != 2:  # TMLE_PDISC_CMCE
+            mle_pdisc_lsb = self._bits_to_uint(tl_sdu_bits, 0, 3, lsb=True)
+            if mle_pdisc_lsb != 2:
+                return None
+            use_lsb = True
+
+        cmce_type = self._bits_to_uint(tl_sdu_bits, 3, 5, lsb=use_lsb)
+        cmce_type_alt = self._bits_to_uint(tl_sdu_bits, 3, 5, lsb=not use_lsb)
+        known_types = set(range(0x00, 0x11))
+        if cmce_type not in known_types and cmce_type_alt in known_types:
+            cmce_type = cmce_type_alt
+            use_lsb = not use_lsb
+
+        cmce_bits = tl_sdu_bits[3:]
+
+        def score_meta(meta: Optional[CallMetadata]) -> int:
+            if meta is None:
+                return -1
+            score = 0
+            if meta.source_ssi:
+                score += 2
+            if meta.dest_ssi:
+                score += 2
+            if meta.call_identifier is not None:
+                score += 1
+            if meta.talkgroup_id:
+                score += 1
+            return score
+
+        def pick_meta(primary: Optional[CallMetadata], alt: Optional[CallMetadata]) -> Optional[CallMetadata]:
+            if primary is None:
+                return alt
+            if alt is None:
+                return primary
+            return alt if score_meta(alt) > score_meta(primary) else primary
+
+        alt_lsb = not use_lsb
+
+        if cmce_type == 0x07:
+            return pick_meta(
+                self._parse_cmce_d_setup(cmce_bits, mac_pdu.extra, lsb=use_lsb),
+                self._parse_cmce_d_setup(cmce_bits, mac_pdu.extra, lsb=alt_lsb),
+            )
+        if cmce_type == 0x0B:
+            return pick_meta(
+                self._parse_cmce_d_tx_granted(cmce_bits, mac_pdu.extra, lsb=use_lsb),
+                self._parse_cmce_d_tx_granted(cmce_bits, mac_pdu.extra, lsb=alt_lsb),
+            )
+        if cmce_type == 0x09:
+            return pick_meta(
+                self._parse_cmce_d_tx_ceased(cmce_bits, mac_pdu.extra, lsb=use_lsb),
+                self._parse_cmce_d_tx_ceased(cmce_bits, mac_pdu.extra, lsb=alt_lsb),
+            )
+        if cmce_type == 0x08:
+            return pick_meta(
+                self._parse_cmce_d_status(cmce_bits, mac_pdu.extra, lsb=use_lsb),
+                self._parse_cmce_d_status(cmce_bits, mac_pdu.extra, lsb=alt_lsb),
+            )
+        if cmce_type == 0x06:
+            return pick_meta(
+                self._parse_cmce_d_release(cmce_bits, mac_pdu.extra, lsb=use_lsb),
+                self._parse_cmce_d_release(cmce_bits, mac_pdu.extra, lsb=alt_lsb),
+            )
+        if cmce_type == 0x02:
+            return pick_meta(
+                self._parse_cmce_d_connect(cmce_bits, mac_pdu.extra, lsb=use_lsb),
+                self._parse_cmce_d_connect(cmce_bits, mac_pdu.extra, lsb=alt_lsb),
+            )
+        if cmce_type == 0x0F:
+            return pick_meta(
+                self._parse_cmce_d_sds(cmce_bits, mac_pdu.extra, lsb=use_lsb),
+                self._parse_cmce_d_sds(cmce_bits, mac_pdu.extra, lsb=alt_lsb),
+            )
+        if cmce_type == 0x05:
+            return pick_meta(
+                self._parse_cmce_d_info(cmce_bits, mac_pdu.extra, lsb=use_lsb),
+                self._parse_cmce_d_info(cmce_bits, mac_pdu.extra, lsb=alt_lsb),
+            )
+        return None
+
+    def _parse_cmce_d_setup(self, bits: np.ndarray, resource: dict, *, lsb: bool = False) -> Optional[CallMetadata]:
+        """Parse CMCE D-SETUP message for call metadata."""
+        if bits is None or len(bits) < 30:
+            return None
+        bits_to_uint = lambda start, length: self._bits_to_uint(bits, start, length, lsb=lsb)
+
+        n = 0
+        _ = bits_to_uint(n, 5); n += 5  # pdu_type
+        call_ident = bits_to_uint(n, 14); n += 14
+        _ = bits_to_uint(n, 4); n += 4  # call timeout
+        _ = bits_to_uint(n, 1); n += 1  # hook method
+        _ = bits_to_uint(n, 1); n += 1  # duplex
+        _ = bits_to_uint(n, 8); n += 8  # basic info
+        _ = bits_to_uint(n, 2); n += 2  # tx grant
+        _ = bits_to_uint(n, 1); n += 1  # tx perm
+        _ = bits_to_uint(n, 4); n += 4  # call prio
+        if n >= len(bits):
+            return None
+        o_bit = bits_to_uint(n, 1); n += 1
+
+        calling_ssi = None
+        if o_bit:
+            if n < len(bits):
+                pbit_notif = bits_to_uint(n, 1); n += 1
+                if pbit_notif:
+                    n += 6
+            if n < len(bits):
+                pbit_temp = bits_to_uint(n, 1); n += 1
+                if pbit_temp:
+                    n += 24
+            if n < len(bits):
+                pbit_cpti = bits_to_uint(n, 1); n += 1
+                if pbit_cpti and n + 2 <= len(bits):
+                    cpti = bits_to_uint(n, 2); n += 2
+                    if cpti == 0 and n + 8 <= len(bits):
+                        n += 8
+                    elif cpti == 1 and n + 24 <= len(bits):
+                        calling_ssi = bits_to_uint(n, 24); n += 24
+                    elif cpti == 2 and n + 48 <= len(bits):
+                        calling_ssi = bits_to_uint(n, 24); n += 24
+                        n += 24  # extension
+
+        talkgroup = self._resource_talkgroup(resource)
+        if not self._is_valid_ssi(calling_ssi):
+            calling_ssi = None
+
+        return CallMetadata(
+            call_type="Group" if talkgroup is not None else "Individual",
+            talkgroup_id=talkgroup,
+            source_ssi=calling_ssi,
+            dest_ssi=None,
+            channel_allocated=resource.get("carrier"),
+            call_identifier=call_ident,
+            call_priority=0,
+            mcc=self.mcc,
+            mnc=self.mnc,
+            encryption_enabled=resource.get("encryption_mode", 0) > 0,
+            encryption_algorithm="TEA1" if resource.get("encryption_mode", 0) > 0 else None,
+        )
+
+    def _parse_cmce_d_tx_granted(self, bits: np.ndarray, resource: dict, *, lsb: bool = False) -> Optional[CallMetadata]:
+        """Parse CMCE D-TX-GRANTED for caller SSI."""
+        if bits is None or len(bits) < 24:
+            return None
+        bits_to_uint = lambda start, length: self._bits_to_uint(bits, start, length, lsb=lsb)
+
+        n = 0
+        _ = bits_to_uint(n, 5); n += 5  # pdu_type
+        call_ident = bits_to_uint(n, 14); n += 14
+        _ = bits_to_uint(n, 2); n += 2  # tx grant
+        _ = bits_to_uint(n, 1); n += 1  # tx perm
+        _ = bits_to_uint(n, 1); n += 1  # enc control
+        _ = bits_to_uint(n, 1); n += 1  # reserved
+        if n >= len(bits):
+            return None
+        o_bit = bits_to_uint(n, 1); n += 1
+
+        tx_ssi = None
+        if o_bit:
+            if n < len(bits):
+                pbit_nid = bits_to_uint(n, 1); n += 1
+                if pbit_nid:
+                    n += 6
+            if n < len(bits):
+                pbit_tpti = bits_to_uint(n, 1); n += 1
+                if pbit_tpti and n + 2 <= len(bits):
+                    tpti = bits_to_uint(n, 2); n += 2
+                    if tpti == 0 and n + 8 <= len(bits):
+                        n += 8
+                    elif tpti == 1 and n + 24 <= len(bits):
+                        tx_ssi = bits_to_uint(n, 24); n += 24
+                    elif tpti == 2 and n + 48 <= len(bits):
+                        tx_ssi = bits_to_uint(n, 24); n += 24
+                        n += 24
+
+        if not self._is_valid_ssi(tx_ssi):
+            tx_ssi = None
+        talkgroup = self._resource_talkgroup(resource)
+
+        return CallMetadata(
+            call_type="Group" if talkgroup is not None else "Individual",
+            talkgroup_id=talkgroup,
+            source_ssi=tx_ssi,
+            dest_ssi=None,
+            channel_allocated=resource.get("carrier"),
+            call_identifier=call_ident,
+            call_priority=0,
+            mcc=self.mcc,
+            mnc=self.mnc,
+            encryption_enabled=resource.get("encryption_mode", 0) > 0,
+            encryption_algorithm="TEA1" if resource.get("encryption_mode", 0) > 0 else None,
+        )
+
+    def _parse_cmce_d_sds(self, bits: np.ndarray, resource: dict, *, lsb: bool = False) -> Optional[CallMetadata]:
+        """Parse CMCE D-SDS DATA for source/destination SSI."""
+        if bits is None or len(bits) < 7:
+            return None
+        bits_to_uint = lambda start, length: self._bits_to_uint(bits, start, length, lsb=lsb)
+
+        n = 0
+        _ = bits_to_uint(n, 5); n += 5  # pdu_type
+        cpti = bits_to_uint(n, 2); n += 2
+        calling_ssi = None
+        if cpti == 0 and n + 8 <= len(bits):
+            n += 8
+        elif cpti == 1 and n + 24 <= len(bits):
+            calling_ssi = bits_to_uint(n, 24)
+            n += 24
+        elif cpti == 2 and n + 48 <= len(bits):
+            calling_ssi = bits_to_uint(n, 24)
+            n += 48
+
+        dest_ssi = self._resource_talkgroup(resource)
+        if not self._is_valid_ssi(calling_ssi):
+            calling_ssi = None
+        if not self._is_valid_ssi(dest_ssi):
+            dest_ssi = None
+
+        return CallMetadata(
+            call_type="SDS",
+            talkgroup_id=None,
+            source_ssi=calling_ssi,
+            dest_ssi=dest_ssi,
+            channel_allocated=resource.get("carrier"),
+            call_identifier=None,
+            call_priority=0,
+            mcc=self.mcc,
+            mnc=self.mnc,
+            encryption_enabled=resource.get("encryption_mode", 0) > 0,
+            encryption_algorithm="TEA1" if resource.get("encryption_mode", 0) > 0 else None,
+        )
+
+    def _parse_cmce_d_info(self, bits: np.ndarray, resource: dict, *, lsb: bool = False) -> Optional[CallMetadata]:
+        """Parse CMCE D-INFO (best-effort for call identifier)."""
+        if bits is None or len(bits) < 19:
+            return None
+        bits_to_uint = lambda start, length: self._bits_to_uint(bits, start, length, lsb=lsb)
+
+        n = 0
+        _ = bits_to_uint(n, 5); n += 5  # pdu_type
+        call_ident = bits_to_uint(n, 14)
+
+        talkgroup = self._resource_talkgroup(resource)
+
+        return CallMetadata(
+            call_type="Info",
+            talkgroup_id=talkgroup,
+            source_ssi=None,
+            dest_ssi=None,
+            channel_allocated=resource.get("carrier"),
+            call_identifier=call_ident,
+            call_priority=0,
+            mcc=self.mcc,
+            mnc=self.mnc,
+            encryption_enabled=resource.get("encryption_mode", 0) > 0,
+            encryption_algorithm="TEA1" if resource.get("encryption_mode", 0) > 0 else None,
+        )
+
+    def _parse_cmce_d_status(self, bits: np.ndarray, resource: dict, *, lsb: bool = False) -> Optional[CallMetadata]:
+        """Parse CMCE D-STATUS for calling SSI."""
+        if bits is None or len(bits) < 24:
+            return None
+        bits_to_uint = lambda start, length: self._bits_to_uint(bits, start, length, lsb=lsb)
+
+        n = 0
+        _ = bits_to_uint(n, 5); n += 5  # pdu_type
+        cpti = bits_to_uint(n, 2); n += 2
+        calling_ssi = None
+        if cpti == 0 and n + 8 <= len(bits):
+            n += 8
+        elif cpti == 1 and n + 24 <= len(bits):
+            calling_ssi = bits_to_uint(n, 24); n += 24
+        elif cpti == 2 and n + 48 <= len(bits):
+            calling_ssi = bits_to_uint(n, 24); n += 24
+            n += 24
+
+        talkgroup = self._resource_talkgroup(resource)
+        if not self._is_valid_ssi(calling_ssi):
+            calling_ssi = None
+
+        return CallMetadata(
+            call_type="Status",
+            talkgroup_id=talkgroup,
+            source_ssi=calling_ssi,
+            dest_ssi=None,
+            channel_allocated=resource.get("carrier"),
+            call_identifier=None,
+            call_priority=0,
+            mcc=self.mcc,
+            mnc=self.mnc,
+            encryption_enabled=resource.get("encryption_mode", 0) > 0,
+            encryption_algorithm="TEA1" if resource.get("encryption_mode", 0) > 0 else None,
+        )
+
+    def _parse_cmce_d_release(self, bits: np.ndarray, resource: dict, *, lsb: bool = False) -> Optional[CallMetadata]:
+        """Parse CMCE D-RELEASE for call identifier."""
+        if bits is None or len(bits) < 26:
+            return None
+        bits_to_uint = lambda start, length: self._bits_to_uint(bits, start, length, lsb=lsb)
+
+        n = 0
+        _ = bits_to_uint(n, 5); n += 5  # pdu_type
+        call_ident = bits_to_uint(n, 14); n += 14
+
+        talkgroup = self._resource_talkgroup(resource)
+
+        return CallMetadata(
+            call_type="Release",
+            talkgroup_id=talkgroup,
+            source_ssi=None,
+            dest_ssi=None,
+            channel_allocated=resource.get("carrier"),
+            call_identifier=call_ident,
+            call_priority=0,
+            mcc=self.mcc,
+            mnc=self.mnc,
+            encryption_enabled=resource.get("encryption_mode", 0) > 0,
+            encryption_algorithm="TEA1" if resource.get("encryption_mode", 0) > 0 else None,
+        )
+
+    def _parse_cmce_d_connect(self, bits: np.ndarray, resource: dict, *, lsb: bool = False) -> Optional[CallMetadata]:
+        """Parse CMCE D-CONNECT for call identifier."""
+        if bits is None or len(bits) < 24:
+            return None
+        bits_to_uint = lambda start, length: self._bits_to_uint(bits, start, length, lsb=lsb)
+
+        n = 0
+        _ = bits_to_uint(n, 5); n += 5  # pdu_type
+        call_ident = bits_to_uint(n, 14); n += 14
+
+        talkgroup = self._resource_talkgroup(resource)
+
+        return CallMetadata(
+            call_type="Connect",
+            talkgroup_id=talkgroup,
+            source_ssi=None,
+            dest_ssi=None,
+            channel_allocated=resource.get("carrier"),
+            call_identifier=call_ident,
+            call_priority=0,
+            mcc=self.mcc,
+            mnc=self.mnc,
+            encryption_enabled=resource.get("encryption_mode", 0) > 0,
+            encryption_algorithm="TEA1" if resource.get("encryption_mode", 0) > 0 else None,
+        )
+
+    def _parse_cmce_d_tx_ceased(self, bits: np.ndarray, resource: dict, *, lsb: bool = False) -> Optional[CallMetadata]:
+        """Parse CMCE D-TX-CEASED (best-effort, similar to D-TX-GRANTED)."""
+        return self._parse_cmce_d_tx_granted(bits, resource, lsb=lsb)
+
     def parse_call_metadata(self, mac_pdu: MacPDU) -> Optional[CallMetadata]:
         """
         Extract call metadata from MAC PDU (talkgroup, SSI, etc.).
@@ -604,20 +1263,38 @@ class TetraProtocolParser:
         Returns:
             CallMetadata or None
         """
-        if not mac_pdu or len(mac_pdu.data) < 4:
+        if not mac_pdu:
             return None
-        
-        # Parse based on PDU type
+
+        if mac_pdu.tm_sdu_bits is not None and mac_pdu.extra:
+            cmce_meta = self._parse_cmce_metadata(mac_pdu)
+            if cmce_meta:
+                if cmce_meta.source_ssi:
+                    self._ssi_votes[cmce_meta.source_ssi] += 1
+                if cmce_meta.dest_ssi:
+                    self._ssi_votes[cmce_meta.dest_ssi] += 1
+                if mac_pdu.crc_ok is False:
+                    ssi_values = [v for v in (cmce_meta.source_ssi, cmce_meta.dest_ssi) if v]
+                    if not ssi_values:
+                        return None
+                    if not any(self._ssi_votes[v] >= 2 for v in ssi_values):
+                        return None
+                return cmce_meta
+
+        if mac_pdu.crc_ok is False:
+            return None
+
+        if mac_pdu.encrypted:
+            return None
+
+        # Parse based on PDU type (fallback)
         if mac_pdu.pdu_type == PDUType.MAC_RESOURCE:
-            # Resource assignment - contains channel allocation
             return self._parse_resource_assignment(mac_pdu)
-        elif mac_pdu.pdu_type == PDUType.MAC_U_SIGNAL:
-            # Signaling - contains call setup
+        if mac_pdu.pdu_type == PDUType.MAC_U_SIGNAL:
             return self._parse_call_setup(mac_pdu)
-        elif mac_pdu.pdu_type == PDUType.MAC_BROADCAST:
-            # Broadcast - contains network info
+        if mac_pdu.pdu_type == PDUType.MAC_BROADCAST:
             return self._parse_broadcast(mac_pdu)
-        
+
         return None
     
     def _parse_resource_assignment(self, mac_pdu: MacPDU) -> Optional[CallMetadata]:
@@ -625,41 +1302,28 @@ class TetraProtocolParser:
         data = mac_pdu.data
         if len(data) < 8:
             return None
-        
-        # Extract fields (Heuristic mapping)
-        # Byte 0: [CallType(1) | ... ]
+
         call_type = "Group" if data[0] & 0x80 else "Individual"
-        
-        # Bytes 1-3: Talkgroup/SSI (24 bits)
-        talkgroup_id = int.from_bytes(data[1:4], 'big') & 0xFFFFFF
-        
-        # Byte 4: Channel Allocation
-        channel_allocated = data[4] & 0x3F
-        
-        # Byte 5: Encryption & Priority
-        encryption_enabled = bool(data[5] & 0x80)
-        call_priority = (data[5] >> 2) & 0x0F  # Guessing priority location (4 bits)
-        
-        # Bytes 6-7: Call Identifier (14 bits)
-        # Usually in the lower bits of byte 6 and upper of byte 7
-        call_identifier = ((data[6] & 0x0F) << 10) | (data[7] << 2) # Rough guess
-        
-        # Try to find Source SSI (Calling Party) in the payload (TM-SDU)
-        # This is a heuristic search for a 24-bit SSI that is NOT the talkgroup
+
+        talkgroup_id = None
         source_ssi = None
-        if len(data) > 10:
-            # Scan for potential SSIs (3 bytes)
-            # Valid SSI range: 1 - 16777215 (0 is reserved, >16M is reserved/short)
-            # We skip the first few bytes which are MAC header
-            for i in range(8, len(data) - 3):
-                val = int.from_bytes(data[i:i+3], 'big') & 0xFFFFFF
-                # Heuristic: SSI should be different from TG, and look "reasonable"
-                # Most user SSIs are > 1000 and < 16000000
-                if val != talkgroup_id and 1000 < val < 16000000:
-                    # Check if it looks like a valid SSI (not all FFs or 00s)
-                    if val != 0xFFFFFF and val != 0:
-                        source_ssi = val
-                        break
+        if mac_pdu.extra:
+            talkgroup_id = self._resource_talkgroup(mac_pdu.extra)
+        if talkgroup_id is None and self._is_valid_ssi(mac_pdu.address):
+            talkgroup_id = mac_pdu.address
+
+        channel_allocated = None
+        if mac_pdu.extra:
+            channel_allocated = mac_pdu.extra.get("carrier")
+
+        encryption_enabled = False
+        if mac_pdu.extra and mac_pdu.extra.get("encryption_mode"):
+            encryption_enabled = mac_pdu.extra.get("encryption_mode", 0) > 0
+        call_priority = (data[5] >> 2) & 0x0F if len(data) > 5 else 0
+
+        call_identifier = None
+        if len(data) > 7:
+            call_identifier = ((data[6] & 0x0F) << 10) | (data[7] << 2)
         
         self.stats['control_messages'] += 1
         
@@ -686,6 +1350,10 @@ class TetraProtocolParser:
         # Extract SSIs
         source_ssi = int.from_bytes(data[0:3], 'big') & 0xFFFFFF
         dest_ssi = int.from_bytes(data[3:6], 'big') & 0xFFFFFF
+        if not self._is_valid_ssi(source_ssi):
+            source_ssi = None
+        if not self._is_valid_ssi(dest_ssi):
+            dest_ssi = None
         
         # Call type
         call_type_byte = data[6]
@@ -712,7 +1380,7 @@ class TetraProtocolParser:
         
         return CallMetadata(
             call_type=call_type,
-            talkgroup_id=dest_ssi if call_type == "Voice" else None,
+            talkgroup_id=dest_ssi if call_type == "Voice" and dest_ssi is not None else None,
             source_ssi=source_ssi,
             dest_ssi=dest_ssi,
             channel_allocated=None,
@@ -762,11 +1430,8 @@ class TetraProtocolParser:
                 logger.debug(f"Invalid MNC {mnc} - likely noise, not real TETRA")
                 return None
             
-            # Update parser state
-            self.mcc = mcc
-            self.mnc = mnc
-            self.colour_code = colour_code
-            
+            self._record_network_candidate(mcc, mnc, colour_code, strong=mac_pdu.crc_ok is True)
+
             logger.info(f"Decoded TETRA network: MCC={mcc} MNC={mnc} CC={colour_code}")
             
             # Return metadata with just network info

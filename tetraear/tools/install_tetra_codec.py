@@ -122,7 +122,7 @@ def download_codec():
         )
 
         with urllib.request.urlopen(req) as response, open(CODEC_FILE, "wb") as out_file:
-            out_file.write(response.read())
+            shutil.copyfileobj(response, out_file)
 
         print(f"[+] Download complete: {CODEC_FILE}")
 
